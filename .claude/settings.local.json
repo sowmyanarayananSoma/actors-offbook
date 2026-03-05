@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx expo:*)",
+      "Bash(ls:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx expo-doctor:*)",
+      "Bash(\"/c/Actors Offbook/.gitignore\":*)"
+    ]
+  }
+}
