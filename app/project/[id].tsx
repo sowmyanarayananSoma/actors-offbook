@@ -106,7 +106,7 @@ export default function ProjectDetailScreen() {
                 variant="bodyLarge"
                 style={{ color: theme.colors.onSurfaceVariant, textAlign: 'center' }}
               >
-                No scenes yet.{'\n'}Add a scene or import a script.
+                No scenes yet.{'\n'}Tap + to add a scene.
               </Text>
             </View>
           ) : (
@@ -149,13 +149,6 @@ export default function ProjectDetailScreen() {
       )}
 
       <View style={styles.fabGroup}>
-        <FAB
-          icon="file-import-outline"
-          variant="secondary"
-          style={[styles.fabSecondary, { backgroundColor: theme.colors.secondaryContainer }]}
-          onPress={() => router.push(`/project/import/${id}`)}
-          label="Import"
-        />
         <FAB
           icon="plus"
           style={[styles.fab, { backgroundColor: theme.colors.primary }]}

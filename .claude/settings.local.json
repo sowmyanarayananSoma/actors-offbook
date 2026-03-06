@@ -6,7 +6,8 @@
       "Bash(ls:*)",
       "Bash(npx tsc:*)",
       "Bash(npx expo-doctor:*)",
-      "Bash(\"/c/Actors Offbook/.gitignore\":*)"
+      "Bash(\"/c/Actors Offbook/.gitignore\":*)",
+      "Bash(grep -n \"handleAttachDoc\\\\|handleRemoveDoc\\\\|WebView\\\\|docUri\\\\|showDoc\\\\|buttonRow\" app/project/scene/[id].tsx)"
     ]
   }
 }

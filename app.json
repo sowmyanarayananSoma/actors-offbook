@@ -16,10 +16,12 @@
       "bundleIdentifier": "com.actorsoffbook.app",
       "infoPlist": {
         "UIBackgroundModes": [
+          "audio",
           "audio"
         ],
         "NSMicrophoneUsageDescription": "Actors Offbook needs microphone access to record your voice for line comparison in practice mode.",
-        "NSSpeechRecognitionUsageDescription": "Allow $(PRODUCT_NAME) to use speech recognition."
+        "NSSpeechRecognitionUsageDescription": "Allow $(PRODUCT_NAME) to use speech recognition.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {

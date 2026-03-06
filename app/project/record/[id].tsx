@@ -29,6 +29,8 @@ import {
 } from 'react-native-paper';
 import { useLocalSearchParams } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { WebView } from 'react-native-webview';
+import * as Haptics from 'expo-haptics';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Reanimated, {
   runOnJS,
@@ -39,10 +41,23 @@ import Reanimated, {
 } from 'react-native-reanimated';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
-import {
-  ExpoSpeechRecognitionModule,
-  useSpeechRecognitionEvent,
-} from 'expo-speech-recognition';
+
+// expo-speech-recognition requires a dev build — stub it out for Expo Go
+let SpeechModule = {
+  abort: () => {},
+  stop: () => {},
+  start: (_opts: Record<string, unknown>) => {},
+  requestPermissionsAsync: async () => {},
+};
+let useSpeechRecognitionEvent: (event: string, handler: (e: { results: { transcript: string }[] }) => void) => void = () => {};
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const mod = require('expo-speech-recognition');
+  SpeechModule = mod.SpeechModule;
+  useSpeechRecognitionEvent = mod.useSpeechRecognitionEvent;
+} catch {
+  // Running in Expo Go — STT unavailable, audio recording still works
+}
 import { useProjectStore } from '@/stores/projectStore';
 import { useSceneStore } from '@/stores/sceneStore';
 import { generateId } from '@/db/repositories/utils';
@@ -81,6 +96,16 @@ async function loadTrackClips(sceneId: string): Promise<TrackClip[]> {
   } catch {
     return [];
   }
+}
+
+async function loadDocUri(sceneId: string): Promise<string | null> {
+  try {
+    const path = `${FileSystem.documentDirectory ?? ''}docs/scene_${sceneId}.json`;
+    const info = await FileSystem.getInfoAsync(path);
+    if (!info.exists) return null;
+    const json = await FileSystem.readAsStringAsync(path);
+    return JSON.parse(json).uri ?? null;
+  } catch { return null; }
 }
 
 async function saveTrackClips(sceneId: string, clips: TrackClip[]): Promise<void> {
@@ -275,6 +300,9 @@ export default function RecordVoicesScreen() {
   const [playingClipId, setPlayingClipId] = useState<string | null>(null);
   const [isPlayingAll, setIsPlayingAll] = useState(false);
 
+  // Document viewer
+  const [docUri, setDocUri] = useState<string | null>(null);
+
   // Drag state
   const [dragActive, setDragActive] = useState(false);
   const anyDragActive = useSharedValue(false);
@@ -288,6 +316,7 @@ export default function RecordVoicesScreen() {
   const stopDelayRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptRef = useRef('');
   const recordingCharRef = useRef<Character | null>(null);
+  const trackScrollRef = useRef<ScrollView>(null);
 
   // ── Load ────────────────────────────────────────────────────────────────────
 
@@ -307,6 +336,10 @@ export default function RecordVoicesScreen() {
     }
   }, [currentScene?.id]);
 
+  useEffect(() => {
+    if (currentScene?.id) loadDocUri(currentScene.id).then(setDocUri);
+  }, [currentScene?.id]);
+
   // ── Speech recognition events ─────────────────────────────────────────────────
 
   useSpeechRecognitionEvent('result', (e) => {
@@ -322,7 +355,7 @@ export default function RecordVoicesScreen() {
       cancelPlaybackRef.current = true;
       recordingRef.current?.stopAndUnloadAsync().catch(() => {});
       soundRef.current?.unloadAsync().catch(() => {});
-      ExpoSpeechRecognitionModule.abort();
+      SpeechModule.abort();
       Audio.setAudioModeAsync({ allowsRecordingIOS: false }).catch(() => {});
     };
   }, []);
@@ -381,8 +414,8 @@ export default function RecordVoicesScreen() {
       // Start speech recognition in parallel (best-effort — transcript may be empty)
       transcriptRef.current = '';
       try {
-        await ExpoSpeechRecognitionModule.requestPermissionsAsync();
-        ExpoSpeechRecognitionModule.start({
+        await SpeechModule.requestPermissionsAsync();
+        SpeechModule.start({
           lang: char.voiceSettings.language ?? 'en-US',
           interimResults: true,
           continuous: true,
@@ -407,7 +440,7 @@ export default function RecordVoicesScreen() {
         setRecordingCharId(char.id);
         setLiveAmplitudes([...FLAT_AMPLITUDES]);
       } catch (err) {
-        ExpoSpeechRecognitionModule.abort();
+        SpeechModule.abort();
         await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
         Alert.alert('Recording Error', String(err));
       }
@@ -432,7 +465,7 @@ export default function RecordVoicesScreen() {
         setLiveAmplitudes([...FLAT_AMPLITUDES]);
 
         // Stop STT and wait briefly for the final result to arrive
-        try { ExpoSpeechRecognitionModule.stop(); } catch { /* ignore */ }
+        try { SpeechModule.stop(); } catch { /* ignore */ }
         await new Promise<void>((r) => setTimeout(r, 250));
         const transcript = transcriptRef.current;
 
@@ -469,6 +502,8 @@ export default function RecordVoicesScreen() {
             saveTrackClips(currentScene.id, next).catch(() => {});
             return next;
           });
+          // Scroll to reveal the newly added clip
+          setTimeout(() => trackScrollRef.current?.scrollToEnd({ animated: true }), 50);
         } catch (err) {
           await Audio.setAudioModeAsync({ allowsRecordingIOS: false }).catch(() => {});
           Alert.alert('Save Error', String(err));
@@ -488,9 +523,11 @@ export default function RecordVoicesScreen() {
     setSelectedClipId(null);
     await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
 
+    let scrollX = 0;
     for (const clip of clips) {
       if (cancelPlaybackRef.current) break;
 
+      trackScrollRef.current?.scrollTo({ x: scrollX, animated: true });
       setPlayingClipId(clip.id);
       try {
         const { sound } = await Audio.Sound.createAsync(
@@ -512,6 +549,7 @@ export default function RecordVoicesScreen() {
       } catch {
         // Skip clip on error
       }
+      scrollX += (blockWidthsRef.current[clip.id] ?? clipWidth(clip)) + 6;
     }
 
     setPlayingClipId(null);
@@ -600,65 +638,21 @@ export default function RecordVoicesScreen() {
       style={[styles.container, { backgroundColor: theme.colors.background }]}
       edges={['bottom']}
     >
-      {/* ── Character chips — hold to record ── */}
-      <Surface style={[styles.section, { backgroundColor: theme.colors.surface }]} elevation={1}>
-        <Text
-          variant="labelMedium"
-          style={{ color: theme.colors.onSurfaceVariant, marginBottom: 10 }}
-        >
-          Hold a character to record
-        </Text>
-        {sceneCharacters.length === 0 ? (
-          <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
-            No characters found. Add characters from the scene screen.
-          </Text>
-        ) : (
-          <View style={styles.chipGrid}>
-            {sceneCharacters.map((char) => {
-              const active = recordingCharId === char.id;
-              return (
-                <Pressable
-                  key={char.id}
-                  onPressIn={() => handleRecordStart(char)}
-                  onPressOut={() => handleRecordStop(char)}
-                  style={[
-                    styles.charButton,
-                    {
-                      backgroundColor: active ? char.color : char.color + '33',
-                      borderColor: char.color,
-                      borderWidth: active ? 2 : 1,
-                    },
-                  ]}
-                >
-                  <Text style={[styles.charButtonIcon, { color: active ? '#fff' : char.color }]}>
-                    {active ? '⏺' : '●'}
-                  </Text>
-                  <Text
-                    style={[styles.charButtonLabel, { color: active ? '#fff' : char.color }]}
-                    numberOfLines={2}
-                  >
-                    {char.name}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-        )}
-
-        {/* Live waveform */}
-        {isRecording && recordingChar && (
-          <View style={styles.waveformRow}>
-            <View style={[styles.recDot, { backgroundColor: '#EF4444' }]} />
-            <Waveform amplitudes={liveAmplitudes} color={recordingChar.color} />
-            <Text variant="labelSmall" style={{ color: '#EF4444', marginLeft: 6 }}>
-              Release to stop
-            </Text>
-          </View>
-        )}
-      </Surface>
+      {/* ── Script document ── */}
+      {docUri && (
+        <View style={styles.docPanel}>
+          <WebView
+            source={{ uri: docUri }}
+            style={{ flex: 1 }}
+            originWhitelist={['*']}
+            allowFileAccess
+            allowingReadAccessToURL={FileSystem.documentDirectory ?? undefined}
+          />
+        </View>
+      )}
 
       {/* ── Master track ── */}
-      <Surface style={[styles.section, { backgroundColor: theme.colors.surface, flex: 1 }]} elevation={1}>
+      <Surface style={[styles.section, { backgroundColor: theme.colors.surface }]} elevation={1}>
         {/* Track header */}
         <View style={styles.trackHeader}>
           <Text variant="labelLarge" style={{ color: theme.colors.onSurfaceVariant, flex: 1 }}>
@@ -686,6 +680,7 @@ export default function RecordVoicesScreen() {
 
         {/* Clip track */}
         <ScrollView
+          ref={trackScrollRef}
           horizontal
           showsHorizontalScrollIndicator={false}
           scrollEnabled={!dragActive}
@@ -695,7 +690,7 @@ export default function RecordVoicesScreen() {
           {clips.length === 0 ? (
             <View style={[styles.emptyTrack, { borderColor: theme.colors.outline }]}>
               <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
-                No clips yet — hold a character above to record
+                No clips yet — hold a character below to record
               </Text>
             </View>
           ) : (
@@ -737,6 +732,69 @@ export default function RecordVoicesScreen() {
           </View>
         )}
       </Surface>
+
+      {/* ── Character chips — hold to record ── */}
+      <Surface style={[styles.section, { backgroundColor: theme.colors.surface }]} elevation={1}>
+        <Text
+          variant="labelMedium"
+          style={{ color: theme.colors.onSurfaceVariant, marginBottom: 10 }}
+        >
+          Hold a character to record
+        </Text>
+        {sceneCharacters.length === 0 ? (
+          <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
+            No characters found. Add characters from the scene screen.
+          </Text>
+        ) : (
+          <View style={styles.chipGrid}>
+            {sceneCharacters.map((char) => {
+              const active = recordingCharId === char.id;
+              return (
+                <Pressable
+                  key={char.id}
+                  onPressIn={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+                    handleRecordStart(char);
+                  }}
+                  onPressOut={() => {
+                    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                    handleRecordStop(char);
+                  }}
+                  style={[
+                    styles.charButton,
+                    {
+                      backgroundColor: active ? char.color : char.color + '33',
+                      borderColor: char.color,
+                      borderWidth: active ? 2 : 1,
+                    },
+                  ]}
+                >
+                  <Text style={[styles.charButtonIcon, { color: active ? '#fff' : char.color }]}>
+                    {active ? '⏺' : '●'}
+                  </Text>
+                  <Text
+                    style={[styles.charButtonLabel, { color: active ? '#fff' : char.color }]}
+                    numberOfLines={2}
+                  >
+                    {char.name}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        )}
+
+        {/* Live waveform */}
+        {isRecording && recordingChar && (
+          <View style={styles.waveformRow}>
+            <View style={[styles.recDot, { backgroundColor: '#EF4444' }]} />
+            <Waveform amplitudes={liveAmplitudes} color={recordingChar.color} />
+            <Text variant="labelSmall" style={{ color: '#EF4444', marginLeft: 6 }}>
+              Release to stop
+            </Text>
+          </View>
+        )}
+      </Surface>
     </SafeAreaView>
   );
 }
@@ -748,6 +806,7 @@ const styles = StyleSheet.create({
   centered: { flex: 1, justifyContent: 'center', alignItems: 'center' },
 
   section: { borderRadius: 12, padding: 12 },
+  docPanel: { flex: 1, borderRadius: 12, overflow: 'hidden' },
 
   // Character buttons
   chipGrid: {

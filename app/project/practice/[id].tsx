@@ -1,10 +1,19 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Animated, ScrollView, View, StyleSheet, Pressable } from 'react-native';
-import { Text, IconButton, useTheme, Modal, Portal, Switch } from 'react-native-paper';
+import { Alert, Animated, PanResponder, ScrollView, View, StyleSheet, Pressable, Dimensions } from 'react-native';
+import { Text, IconButton, useTheme, Modal, Portal, Switch, ActivityIndicator } from 'react-native-paper';
+import { WebView } from 'react-native-webview';
 import { router, useLocalSearchParams } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
+
+// ffmpeg-kit-react-native — optional, requires a native dev build
+let FFmpegKit: { execute: (cmd: string) => Promise<{ getReturnCode: () => Promise<{ isValueSuccess: () => boolean }> }> } | null = null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  FFmpegKit = require('ffmpeg-kit-react-native').FFmpegKit;
+} catch { /* not installed */ }
 import { useProjectStore } from '@/stores/projectStore';
 import { useSceneStore } from '@/stores/sceneStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -12,6 +21,18 @@ import { PracticeEngine } from '@/services/practiceEngine';
 import { MuteOverlay } from '@/components/MuteOverlay';
 import { useNowPlaying } from '@/hooks/useNowPlaying';
 import type { PracticeLineItem, PracticeState, Character, TrackClip } from '@/types';
+
+const SCREEN_HEIGHT = Dimensions.get('window').height;
+
+async function loadDocUri(sceneId: string): Promise<string | null> {
+  try {
+    const path = `${FileSystem.documentDirectory ?? ''}docs/scene_${sceneId}.json`;
+    const info = await FileSystem.getInfoAsync(path);
+    if (!info.exists) return null;
+    const json = await FileSystem.readAsStringAsync(path);
+    return JSON.parse(json).uri ?? null;
+  } catch { return null; }
+}
 
 // ─── Track helpers (mirrors record screen) ────────────────────────────────────
 
@@ -54,6 +75,10 @@ export default function PracticeScreen() {
   const [bufferEditChar, setBufferEditChar] = useState<Character | null>(null);
   const [editPre, setEditPre] = useState(0);
   const [editPost, setEditPost] = useState(0);
+  const [docUri, setDocUri] = useState<string | null>(null);
+  const [showDoc, setShowDoc] = useState(true);
+  const [loopTrack, setLoopTrack] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
 
   // ── Track mode state ─────────────────────────────────────────────────────────
   const [trackClips, setTrackClips] = useState<TrackClip[]>([]);
@@ -64,6 +89,14 @@ export default function PracticeScreen() {
   const playheadAnimRef = useRef<Animated.CompositeAnimation | null>(null);
   const trackSoundRef = useRef<Audio.Sound | null>(null);
   const trackCancelRef = useRef(false);
+  const trackPlayingRef = useRef(false);   // ref mirror avoids stale-closure guard
+  const mutedCharIdsRef = useRef<Set<string>>(new Set()); // ref mirror for mute state
+  const loopTrackRef = useRef(false);                    // ref mirror for loop toggle
+  const trackScrollRef = useRef<ScrollView>(null);
+  const playheadXRef = useRef(0);          // mirrors playheadAnim for PanResponder
+  const dragStartXRef = useRef(0);         // playhead X at drag-start
+  const handleTrackPlayRef = useRef<(startIndex?: number) => Promise<void>>(async () => {});
+  const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
 
   // ── TTS mode state ───────────────────────────────────────────────────────────
   const engineRef = useRef<PracticeEngine | null>(null);
@@ -90,13 +123,20 @@ export default function PracticeScreen() {
         setTrackMode(true);
       }
     });
+    loadDocUri(sceneId).then(setDocUri);
   }, [sceneId]);
 
   // ── Init: default mute actor characters ──────────────────────────────────────
   useEffect(() => {
     const actorIds = characters.filter((c) => c.isActor).map((c) => c.id);
-    setMutedCharIds(new Set(actorIds));
+    const next = new Set(actorIds);
+    setMutedCharIds(next);
+    mutedCharIdsRef.current = next;
   }, [characters]);
+
+  // Keep ref in sync so handleTrackPlay always reads the latest mute state
+  useEffect(() => { mutedCharIdsRef.current = mutedCharIds; }, [mutedCharIds]);
+  useEffect(() => { loopTrackRef.current = loopTrack; }, [loopTrack]);
 
   // ── Load scene data (for TTS mode) ───────────────────────────────────────────
   useEffect(() => {
@@ -134,11 +174,20 @@ export default function PracticeScreen() {
     };
   }, []);
 
+  // ── Keep playheadXRef in sync with animation value ───────────────────────────
+  useEffect(() => {
+    const id = playheadAnim.addListener(({ value }) => { playheadXRef.current = value; });
+    return () => playheadAnim.removeListener(id);
+  }, [playheadAnim]);
+
+  // (handleTrackPlayRef is updated after handleTrackPlay is declared — see below)
+
   // ── Mute toggle ──────────────────────────────────────────────────────────────
   const toggleMute = useCallback((charId: string) => {
     setMutedCharIds((prev) => {
       const next = new Set(prev);
       if (next.has(charId)) { next.delete(charId); } else { next.add(charId); }
+      mutedCharIdsRef.current = next; // update ref immediately, before re-render
       // Rebuild TTS engine if in TTS mode
       const engine = engineRef.current;
       if (engine && !trackMode) {
@@ -149,81 +198,159 @@ export default function PracticeScreen() {
     });
   }, [lines, characters, trackMode]);
 
+  // ── Playhead drag (PanResponder) ─────────────────────────────────────────────
+
+  const playheadPanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => {
+        // Capture position at drag start, then stop playback
+        dragStartXRef.current = playheadXRef.current;
+        trackCancelRef.current = true;
+        trackPlayingRef.current = false;
+        playheadAnimRef.current?.stop();
+        trackSoundRef.current?.stopAsync().catch(() => {});
+        trackSoundRef.current?.unloadAsync().catch(() => {});
+        trackSoundRef.current = null;
+        setTrackPlaying(false);
+        setTrackCurrentIdx(-1);
+        setIsDraggingPlayhead(true);
+      },
+      onPanResponderMove: (_, { dx }) => {
+        const newX = Math.max(0, dragStartXRef.current + dx);
+        playheadAnim.setValue(newX);
+      },
+      onPanResponderRelease: (_, { dx }) => {
+        const finalX = Math.max(0, dragStartXRef.current + dx);
+        playheadAnim.setValue(finalX);
+        setIsDraggingPlayhead(false);
+        // Map final X to nearest clip index
+        const cumXs = clipCumXRef.current;
+        let clipIndex = 0;
+        for (let i = 0; i < cumXs.length; i++) {
+          if (finalX >= cumXs[i]) clipIndex = i;
+          else break;
+        }
+        handleTrackPlayRef.current(clipIndex);
+      },
+      onPanResponderTerminate: () => {
+        setIsDraggingPlayhead(false);
+      },
+    })
+  ).current;
+
   // ── Track playback ────────────────────────────────────────────────────────────
-  const handleTrackPlay = useCallback(async () => {
-    if (trackClips.length === 0 || trackPlaying) return;
+
+  // Compute cumulative X positions for each clip (for seek)
+  const clipCumXRef = useRef<number[]>([]);
+  useEffect(() => {
+    let x = 0;
+    clipCumXRef.current = trackClips.map((c) => {
+      const pos = x;
+      x += trackClipW(c) + TRACK_GAP;
+      return pos;
+    });
+  }, [trackClips]);
+
+  const handleTrackPlay = useCallback(async (startIndex = 0) => {
+    if (trackClips.length === 0 || trackPlayingRef.current) return;
     trackCancelRef.current = false;
+    trackPlayingRef.current = true;
     setTrackPlaying(true);
     await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
 
-    let cumX = 0;
-    for (let i = 0; i < trackClips.length; i++) {
-      if (trackCancelRef.current) break;
+    let currentStart = startIndex;
 
-      const clip = trackClips[i];
-      const clipW = trackClipW(clip);
-      const isMuted = mutedCharIds.has(clip.characterId);
-      const char = characters.find((c) => c.id === clip.characterId);
-      const preMs = char?.voiceSettings.mutePreBufferMs ?? 0;
-      const postMs = char?.voiceSettings.mutePostBufferMs ?? 0;
+    do {
+      let cumX = clipCumXRef.current[currentStart] ?? 0;
+      playheadAnim.setValue(cumX);
 
-      setTrackCurrentIdx(i);
+      for (let i = currentStart; i < trackClips.length; i++) {
+        if (trackCancelRef.current) break;
 
-      // Pre-buffer: playhead stays still
-      if (preMs > 0 && !trackCancelRef.current) {
-        await new Promise<void>((resolve) => setTimeout(resolve, preMs));
-      }
-      if (trackCancelRef.current) break;
+        const clip = trackClips[i];
+        const clipW = trackClipW(clip);
+        const isMuted = mutedCharIdsRef.current.has(clip.characterId);
+        const char = characters.find((c) => c.id === clip.characterId);
+        const preMs = char?.voiceSettings.mutePreBufferMs ?? 0;
+        const postMs = char?.voiceSettings.mutePostBufferMs ?? 0;
 
-      // Animate playhead across this clip's width
-      const anim = Animated.timing(playheadAnim, {
-        toValue: cumX + clipW,
-        duration: clip.durationMs,
-        useNativeDriver: true,
-      });
-      playheadAnimRef.current = anim;
+        setTrackCurrentIdx(i);
+        trackScrollRef.current?.scrollTo({ x: Math.max(0, cumX - 16), animated: true });
 
-      if (isMuted) {
-        // Skip audio — just wait + animate
-        anim.start();
-        await new Promise<void>((resolve) => setTimeout(resolve, clip.durationMs));
-      } else {
-        try {
-          const { sound } = await Audio.Sound.createAsync(
-            { uri: clip.uri },
-            { shouldPlay: true }
-          );
-          trackSoundRef.current = sound;
-          anim.start();
-          await new Promise<void>((resolve) => {
-            sound.setOnPlaybackStatusUpdate((ps) => {
-              if (!ps.isLoaded || ps.didJustFinish || trackCancelRef.current) {
-                sound.unloadAsync().catch(() => {});
-                resolve();
-              }
-            });
-          });
-          trackSoundRef.current = null;
-        } catch {
+        // Pre-buffer: pause before muted clip so actor has a moment to prepare
+        if (isMuted && preMs > 0 && !trackCancelRef.current) {
+          await new Promise<void>((resolve) => setTimeout(resolve, preMs));
+        }
+        if (trackCancelRef.current) break;
+
+        // Animate playhead across this clip's width
+        const anim = Animated.timing(playheadAnim, {
+          toValue: cumX + clipW,
+          duration: clip.durationMs,
+          useNativeDriver: true,
+        });
+        playheadAnimRef.current = anim;
+
+        if (isMuted) {
+          // Skip audio — just wait + animate
           anim.start();
           await new Promise<void>((resolve) => setTimeout(resolve, clip.durationMs));
+        } else {
+          try {
+            const { sound } = await Audio.Sound.createAsync(
+              { uri: clip.uri },
+              { shouldPlay: true }
+            );
+            trackSoundRef.current = sound;
+            anim.start();
+            await new Promise<void>((resolve) => {
+              sound.setOnPlaybackStatusUpdate((ps) => {
+                if (!ps.isLoaded || ps.didJustFinish || trackCancelRef.current) {
+                  sound.unloadAsync().catch(() => {});
+                  resolve();
+                }
+              });
+            });
+            trackSoundRef.current = null;
+          } catch {
+            anim.start();
+            await new Promise<void>((resolve) => setTimeout(resolve, clip.durationMs));
+          }
         }
+
+        // Post-buffer: extra pause after muted clip so actor can finish their line
+        if (isMuted && postMs > 0 && !trackCancelRef.current) {
+          await new Promise<void>((resolve) => setTimeout(resolve, postMs));
+        }
+
+        cumX += clipW + TRACK_GAP;
       }
 
-      // Post-buffer: playhead stays still
-      if (postMs > 0 && !trackCancelRef.current) {
-        await new Promise<void>((resolve) => setTimeout(resolve, postMs));
+      currentStart = 0; // subsequent loops always restart from the beginning
+      if (trackCancelRef.current) break;
+
+      if (loopTrackRef.current) {
+        // Brief pause + playhead reset between loops
+        setTrackCurrentIdx(-1);
+        await new Promise<void>((r) => setTimeout(r, 400));
+        Animated.timing(playheadAnim, { toValue: 0, duration: 250, useNativeDriver: true }).start();
+        await new Promise<void>((r) => setTimeout(r, 300));
       }
+    } while (loopTrackRef.current && !trackCancelRef.current);
 
-      cumX += clipW + TRACK_GAP;
-    }
-
+    trackPlayingRef.current = false;
     setTrackPlaying(false);
     setTrackCurrentIdx(-1);
-  }, [trackClips, mutedCharIds, characters, playheadAnim, trackPlaying]);
+  }, [trackClips, characters, playheadAnim, clipCumXRef]);
+
+  // Keep ref current so PanResponder always calls the latest version
+  useEffect(() => { handleTrackPlayRef.current = handleTrackPlay; }, [handleTrackPlay]);
 
   const handleTrackStop = useCallback(async () => {
     trackCancelRef.current = true;
+    trackPlayingRef.current = false;
     playheadAnimRef.current?.stop();
     await trackSoundRef.current?.stopAsync().catch(() => {});
     await trackSoundRef.current?.unloadAsync().catch(() => {});
@@ -233,9 +360,91 @@ export default function PracticeScreen() {
     Animated.timing(playheadAnim, { toValue: 0, duration: 250, useNativeDriver: true }).start();
   }, [playheadAnim]);
 
+  const handleExport = useCallback(async () => {
+    if (trackClips.length === 0) return;
+
+    if (!FFmpegKit) {
+      Alert.alert(
+        'Export Unavailable',
+        'Add ffmpeg-kit-react-native to the project and rebuild the dev client to enable export.'
+      );
+      return;
+    }
+
+    const canShare = await Sharing.isAvailableAsync();
+    if (!canShare) {
+      Alert.alert('Export Unavailable', 'Sharing is not supported on this device.');
+      return;
+    }
+
+    setIsExporting(true);
+    try {
+      const outDir = `${FileSystem.documentDirectory}exports/`;
+      await FileSystem.makeDirectoryAsync(outDir, { intermediates: true });
+      const outPath = `${outDir}scene_${sceneId}_${Date.now()}.m4a`;
+
+      // Build FFmpeg command: real clip files for unmuted, anullsrc silence for muted
+      const inputArgs: string[] = [];
+      const filterInputs: string[] = [];
+
+      trackClips.forEach((clip, i) => {
+        const isMuted = mutedCharIdsRef.current.has(clip.characterId);
+        if (isMuted) {
+          const durSec = (clip.durationMs / 1000).toFixed(3);
+          inputArgs.push(`-f lavfi -t ${durSec} -i anullsrc=r=44100:cl=stereo`);
+        } else {
+          const path = clip.uri.replace(/^file:\/\//, '');
+          inputArgs.push(`-i "${path}"`);
+        }
+        filterInputs.push(`[${i}:a]`);
+      });
+
+      const filterComplex = `${filterInputs.join('')}concat=n=${trackClips.length}:v=0:a=1[out]`;
+      const outPathRaw = outPath.replace(/^file:\/\//, '');
+      const cmd = `${inputArgs.join(' ')} -filter_complex "${filterComplex}" -map "[out]" -c:a aac -y "${outPathRaw}"`;
+
+      const session = await FFmpegKit.execute(cmd);
+      const returnCode = await session.getReturnCode();
+
+      if (returnCode.isValueSuccess()) {
+        await Sharing.shareAsync(outPath, {
+          mimeType: 'audio/mp4',
+          dialogTitle: 'Export Scene Audio',
+          UTI: 'public.mpeg-4-audio',
+        });
+      } else {
+        Alert.alert('Export Failed', 'Could not create audio file. Please try again.');
+      }
+    } catch (err) {
+      Alert.alert('Export Failed', String(err));
+    } finally {
+      setIsExporting(false);
+    }
+  }, [trackClips, sceneId]);
+
   const handleTrackRestart = useCallback(async () => {
     await handleTrackStop();
   }, [handleTrackStop]);
+
+  const handleSeekToClip = useCallback(async (clipIndex: number) => {
+    // Stop any in-progress playback using the ref (avoids stale-closure from state)
+    if (trackPlayingRef.current) {
+      trackCancelRef.current = true;
+      trackPlayingRef.current = false;
+      playheadAnimRef.current?.stop();
+      await trackSoundRef.current?.stopAsync().catch(() => {});
+      await trackSoundRef.current?.unloadAsync().catch(() => {});
+      trackSoundRef.current = null;
+      setTrackPlaying(false);
+      setTrackCurrentIdx(-1);
+      await new Promise<void>((r) => setTimeout(r, 80));
+    }
+    // Jump playhead to the clip's position
+    const x = clipCumXRef.current[clipIndex] ?? 0;
+    playheadAnim.setValue(x);
+    trackScrollRef.current?.scrollTo({ x: Math.max(0, x - 16), animated: true });
+    handleTrackPlay(clipIndex);
+  }, [handleTrackPlay, playheadAnim]);
 
   // ── TTS controls ─────────────────────────────────────────────────────────────
   const handlePlayPause = () => {
@@ -262,38 +471,42 @@ export default function PracticeScreen() {
   // ── Character chip + buffer modal (shared) ────────────────────────────────────
   const charChips = (
     <View style={styles.charToggles}>
-      {characters.map((char) => (
-        <Pressable
-          key={char.id}
-          onPress={() => toggleMute(char.id)}
-          onLongPress={() => {
-            setEditPre((char.voiceSettings.mutePreBufferMs ?? 0) / 1000);
-            setEditPost((char.voiceSettings.mutePostBufferMs ?? 0) / 1000);
-            setBufferEditChar(char);
-          }}
-        >
-          <View
+      {characters.map((char) => {
+        const muted = mutedCharIds.has(char.id);
+        return (
+          <Pressable
+            key={char.id}
+            onPress={() => toggleMute(char.id)}
+            onLongPress={() => {
+              setEditPre((char.voiceSettings.mutePreBufferMs ?? 0) / 1000);
+              setEditPost((char.voiceSettings.mutePostBufferMs ?? 0) / 1000);
+              setBufferEditChar(char);
+            }}
+            delayLongPress={350}
             style={[
               styles.charToggle,
               {
-                backgroundColor: mutedCharIds.has(char.id) ? char.color + '33' : '#222',
-                borderColor: char.color,
+                backgroundColor: muted ? '#2a2a3a' : char.color + 'B3',
+                borderColor: muted ? '#444' : char.color,
+                borderWidth: muted ? 1 : 2,
               },
             ]}
           >
+            <Text style={[styles.charToggleIcon, { color: muted ? '#555' : '#fff' }]}>
+              {muted ? '🔇' : '🔊'}
+            </Text>
             <Text
-              variant="labelSmall"
-              style={{ color: mutedCharIds.has(char.id) ? char.color : '#999' }}
+              style={[styles.charToggleName, { color: muted ? '#666' : '#fff' }]}
               numberOfLines={1}
             >
               {char.name}
             </Text>
-            <Text style={{ color: mutedCharIds.has(char.id) ? char.color : '#555' }}>
-              {mutedCharIds.has(char.id) ? ' ●' : ' ○'}
+            <Text style={[styles.charToggleHint, { color: muted ? '#333' : '#ffffff88' }]}>
+              hold: buffer
             </Text>
-          </View>
-        </Pressable>
-      ))}
+          </Pressable>
+        );
+      })}
     </View>
   );
 
@@ -317,6 +530,14 @@ export default function PracticeScreen() {
           <Text variant="titleMedium" style={styles.headerTitle} numberOfLines={1}>
             {currentScene?.title ?? 'Practice'}
           </Text>
+          {docUri && (
+            <IconButton
+              icon={showDoc ? 'file-eye' : 'file-eye-outline'}
+              iconColor={showDoc ? '#6366F1' : '#555'}
+              size={22}
+              onPress={() => setShowDoc((v) => !v)}
+            />
+          )}
           <IconButton
             icon="refresh"
             iconColor="#fff"
@@ -363,8 +584,10 @@ export default function PracticeScreen() {
             {/* Track timeline + playhead */}
             <View style={styles.trackArea}>
               <ScrollView
+                ref={trackScrollRef}
                 horizontal
                 showsHorizontalScrollIndicator={false}
+                scrollEnabled={!isDraggingPlayhead}
                 style={styles.trackScroll}
                 contentContainerStyle={styles.trackContent}
               >
@@ -374,8 +597,9 @@ export default function PracticeScreen() {
                   const isMutedClip = mutedCharIds.has(clip.characterId);
                   const isCurrent = i === trackCurrentIdx;
                   return (
-                    <View
+                    <Pressable
                       key={clip.id}
+                      onPress={() => handleSeekToClip(i)}
                       style={[
                         styles.trackClipBlock,
                         {
@@ -383,8 +607,8 @@ export default function PracticeScreen() {
                           backgroundColor: isMutedClip
                             ? '#2a2a3a'
                             : clip.characterColor + 'B3',
-                          borderColor: isCurrent ? clip.characterColor : 'transparent',
-                          borderWidth: isCurrent ? 2 : 0,
+                          borderColor: isCurrent ? clip.characterColor : '#ffffff44',
+                          borderWidth: isCurrent ? 2 : 1,
                         },
                       ]}
                     >
@@ -417,27 +641,35 @@ export default function PracticeScreen() {
                           {isMutedClip ? '●' : fmtDuration(clip.durationMs)}
                         </Text>
                       )}
-                    </View>
+                    </Pressable>
                   );
                 })}
 
-                {/* Playhead */}
+                {/* Playhead — draggable */}
                 <Animated.View
-                  style={[
-                    styles.playhead,
-                    { transform: [{ translateX: playheadAnim }] },
-                  ]}
-                />
+                  style={[styles.playheadHitArea, { transform: [{ translateX: playheadAnim }] }]}
+                  {...playheadPanResponder.panHandlers}
+                >
+                  <View style={[styles.playheadHandle, isDraggingPlayhead && styles.playheadHandleActive]} />
+                  <View style={styles.playheadLine} />
+                </Animated.View>
               </ScrollView>
             </View>
 
             {/* Controls */}
             <View style={styles.trackControls}>
+              <IconButton
+                icon={loopTrack ? 'repeat' : 'repeat-off'}
+                iconColor={loopTrack ? '#6366F1' : '#555'}
+                size={28}
+                onPress={() => setLoopTrack((v) => !v)}
+                style={styles.trackPlayBtn}
+              />
               {trackPlaying ? (
                 <IconButton
                   icon="stop-circle"
                   iconColor="#EF4444"
-                  size={56}
+                  size={44}
                   onPress={handleTrackStop}
                   style={styles.trackPlayBtn}
                 />
@@ -445,18 +677,43 @@ export default function PracticeScreen() {
                 <IconButton
                   icon="play-circle"
                   iconColor="#6366F1"
-                  size={56}
-                  onPress={handleTrackPlay}
+                  size={44}
+                  onPress={() => handleTrackPlay()}
+                  disabled={trackClips.length === 0}
+                  style={styles.trackPlayBtn}
+                />
+              )}
+              {isExporting ? (
+                <ActivityIndicator size={20} style={{ marginHorizontal: 12 }} />
+              ) : (
+                <IconButton
+                  icon="export-variant"
+                  iconColor={trackClips.length > 0 ? '#888' : '#444'}
+                  size={28}
+                  onPress={handleExport}
                   disabled={trackClips.length === 0}
                   style={styles.trackPlayBtn}
                 />
               )}
             </View>
 
+            {/* Document viewer */}
+            {docUri && showDoc && (
+              <View style={styles.practiceDocPanel}>
+                <WebView
+                  source={{ uri: docUri }}
+                  style={{ flex: 1 }}
+                  originWhitelist={['*']}
+                  allowFileAccess
+                  allowingReadAccessToURL={FileSystem.documentDirectory ?? undefined}
+                />
+              </View>
+            )}
+
             {/* Character mute chips */}
             <View style={styles.trackChipArea}>
               <Text variant="labelSmall" style={styles.trackChipHint}>
-                Tap to mute · Long-press for buffer
+                Tap clip to seek · Tap chip to mute · Long-press for buffer
               </Text>
               {charChips}
             </View>
@@ -681,11 +938,31 @@ const styles = StyleSheet.create({
   trackClipName: { fontSize: 11, fontWeight: '700' },
   trackClipTranscript: { fontSize: 10, lineHeight: 13 },
   trackClipDur: { fontSize: 11 },
-  playhead: {
+  // ── Playhead (draggable) ─────────────────────────────────────────────────────
+  playheadHitArea: {
     position: 'absolute',
-    top: 12,
-    bottom: 12,
-    left: 16,
+    top: 8,
+    bottom: 8,
+    left: 4,           // 16 (padding) - 12 (half of 24px hit width) = 4
+    width: 24,
+    alignItems: 'center',
+    zIndex: 10,
+  },
+  playheadHandle: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    marginBottom: 2,
+    opacity: 0.85,
+  },
+  playheadHandleActive: {
+    backgroundColor: '#6366F1',
+    opacity: 1,
+    transform: [{ scale: 1.3 }],
+  },
+  playheadLine: {
+    flex: 1,
     width: 2,
     borderRadius: 1,
     backgroundColor: '#fff',
@@ -693,11 +970,20 @@ const styles = StyleSheet.create({
   },
 
   trackControls: {
+    flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 8,
+    justifyContent: 'center',
+    paddingVertical: 4,
   },
   trackPlayBtn: { margin: 0 },
 
+  practiceDocPanel: {
+    height: SCREEN_HEIGHT * 0.38,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#333',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#333',
+  },
   trackChipArea: {
     paddingHorizontal: 16,
     paddingBottom: 16,
@@ -743,17 +1029,23 @@ const styles = StyleSheet.create({
   charToggles: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
+    gap: 10,
     justifyContent: 'center',
   },
   charToggle: {
-    flexDirection: 'row',
+    width: '30%',
+    flexGrow: 1,
+    minWidth: 80,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    borderRadius: 10,
     alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 20,
+    gap: 2,
     borderWidth: 1,
   },
+  charToggleIcon: { fontSize: 16 },
+  charToggleName: { fontWeight: '700', fontSize: 12, textAlign: 'center' },
+  charToggleHint: { fontSize: 8, textAlign: 'center' },
 
   completeArea: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 },
   completeButtons: { flexDirection: 'row', marginTop: 32, gap: 24 },
